@@ -12,6 +12,7 @@ use media_queries::{Device, MediaType};
 use properties::{self, PropertyDeclaration, PropertyDeclarationBlock, ComputedValues, Importance};
 use quickersort::sort_by;
 use restyle_hints::{RestyleHint, DependencySet};
+use rule_tree::{RuleTree, StrongRuleNode};
 use selector_impl::{ElementExt, TheSelectorImpl, PseudoElement};
 use selectors::Element;
 use selectors::bloom::BloomFilter;
@@ -60,6 +61,11 @@ pub struct Stylist {
     /// rules against the current device.
     element_map: PerPseudoElementSelectorMap,
 
+    /// The rule tree, that stores the results of selector matching.
+    ///
+    /// FIXME(emilio): Not `pub`!
+    pub rule_tree: RuleTree,
+
     /// The selector maps corresponding to a given pseudo-element
     /// (depending on the implementation)
     pseudos_map: FnvHashMap<PseudoElement, PerPseudoElementSelectorMap>,
@@ -70,6 +76,8 @@ pub struct Stylist {
     /// Applicable declarations for a given non-eagerly cascaded pseudo-element.
     /// These are eagerly computed once, and then used to resolve the new
     /// computed values on the fly on layout.
+    ///
+    /// FIXME(emilio): Use the rule tree!
     precomputed_pseudo_element_decls: FnvHashMap<PseudoElement, Vec<ApplicableDeclarationBlock>>,
 
     rules_source_order: usize,
@@ -99,6 +107,7 @@ impl Stylist {
             animations: Default::default(),
             precomputed_pseudo_element_decls: Default::default(),
             rules_source_order: 0,
+            rule_tree: RuleTree::new(),
             state_deps: DependencySet::new(),
 
             // XXX remember resetting them!
@@ -159,8 +168,8 @@ impl Stylist {
         if !stylesheet.is_effective_for_device(&self.device) {
             return;
         }
-        let mut rules_source_order = self.rules_source_order;
 
+        let mut rules_source_order = self.rules_source_order;
         for rule in stylesheet.effective_rules(&self.device) {
             match *rule {
                 CSSRule::Style(ref style_rule) => {
@@ -174,12 +183,12 @@ impl Stylist {
                             self.element_map.borrow_for_origin(&stylesheet.origin)
                         };
 
-                        map.insert(Rule {
-                            selector: selector.complex_selector.clone(),
+                        map.insert(Arc::new(Rule {
+                            selector: Some(selector.complex_selector.clone()),
                             declarations: style_rule.declarations.clone(),
                             specificity: selector.specificity,
                             source_order: rules_source_order,
-                        });
+                        }));
                     }
                     rules_source_order += 1;
 
@@ -241,9 +250,11 @@ impl Stylist {
     pub fn precomputed_values_for_pseudo(&self,
                                          pseudo: &PseudoElement,
                                          parent: Option<&Arc<ComputedValues>>)
-                                         -> Option<Arc<ComputedValues>> {
+                                         -> Option<(Arc<ComputedValues>, StrongRuleNode)> {
         debug_assert!(TheSelectorImpl::pseudo_element_cascade_type(pseudo).is_precomputed());
         if let Some(declarations) = self.precomputed_pseudo_element_decls.get(pseudo) {
+            let rule_node =
+                self.rule_tree.insert_ordered_rules(declarations.iter().map(|a| &a.rule));
             let (computed, _) =
                 properties::cascade(self.device.au_viewport_size(),
                                     &declarations, false,
@@ -251,9 +262,9 @@ impl Stylist {
                                     None,
                                     None,
                                     Box::new(StdoutErrorReporter));
-            Some(Arc::new(computed))
+            Some((Arc::new(computed), rule_node))
         } else {
-            parent.map(|p| p.clone())
+            parent.map(|p| (p.clone(), self.rule_tree.root()))
         }
     }
 
@@ -261,7 +272,7 @@ impl Stylist {
                                                   element: &E,
                                                   pseudo: &PseudoElement,
                                                   parent: &Arc<ComputedValues>)
-                                                  -> Option<Arc<ComputedValues>>
+                                                  -> Option<(Arc<ComputedValues>, StrongRuleNode)>
         where E: Element<Impl=TheSelectorImpl> +
               fmt::Debug +
               PresentationalHintsSynthetizer
@@ -282,6 +293,9 @@ impl Stylist {
                                           &mut declarations,
                                           MatchingReason::ForStyling);
 
+        let rule_node =
+            self.rule_tree.insert_ordered_rules(declarations.iter().map(|a| &a.rule));
+
         let (computed, _) =
             properties::cascade(self.device.au_viewport_size(),
                                 &declarations, false,
@@ -289,7 +303,7 @@ impl Stylist {
                                 Box::new(StdoutErrorReporter));
 
 
-        Some(Arc::new(computed))
+        Some((Arc::new(computed), rule_node))
     }
 
     pub fn set_device(&mut self, mut device: Device, stylesheets: &[Arc<Stylesheet>]) {
@@ -338,9 +352,9 @@ impl Stylist {
                  PresentationalHintsSynthetizer,
               V: Push<ApplicableDeclarationBlock> + VecLike<ApplicableDeclarationBlock>
     {
-        assert!(!self.is_device_dirty);
-        assert!(style_attribute.is_none() || pseudo_element.is_none(),
-                "Style attributes do not apply to pseudo-elements");
+        debug_assert!(!self.is_device_dirty);
+        debug_assert!(style_attribute.is_none() || pseudo_element.is_none(),
+                      "Style attributes do not apply to pseudo-elements");
         debug_assert!(pseudo_element.is_none() ||
                       !TheSelectorImpl::pseudo_element_cascade_type(pseudo_element.as_ref().unwrap())
                         .is_precomputed());
@@ -589,14 +603,14 @@ impl PerPseudoElementSelectorMap {
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub struct SelectorMap {
     // TODO: Tune the initial capacity of the HashMap
-    pub id_hash: FnvHashMap<Atom, Vec<Rule>>,
-    pub class_hash: FnvHashMap<Atom, Vec<Rule>>,
-    pub local_name_hash: FnvHashMap<Atom, Vec<Rule>>,
+    pub id_hash: FnvHashMap<Atom, Vec<Arc<Rule>>>,
+    pub class_hash: FnvHashMap<Atom, Vec<Arc<Rule>>>,
+    pub local_name_hash: FnvHashMap<Atom, Vec<Arc<Rule>>>,
     /// Same as local_name_hash, but keys are lower-cased.
     /// For HTML elements in HTML documents.
-    pub lower_local_name_hash: FnvHashMap<Atom, Vec<Rule>>,
+    pub lower_local_name_hash: FnvHashMap<Atom, Vec<Arc<Rule>>>,
     /// Rules that don't have ID, class, or element selectors.
-    pub other_rules: Vec<Rule>,
+    pub other_rules: Vec<Arc<Rule>>,
     /// Whether this hash is empty.
     pub empty: bool,
 }
@@ -684,7 +698,7 @@ impl SelectorMap {
 
         // Sort only the rules we just added.
         sort_by_key(&mut matching_rules_list[init_len..],
-                    |rule| (rule.specificity, rule.source_order));
+                    |block| (block.rule.specificity, block.rule.source_order));
     }
 
     /// Append to `rule_list` all universal Rules (rules with selector `*|*`) in
@@ -700,27 +714,31 @@ impl SelectorMap {
         let init_len = matching_rules_list.len();
 
         for rule in self.other_rules.iter() {
-            if rule.selector.compound_selector.is_empty() &&
-               rule.selector.next.is_none() {
+            if rule.selector.as_ref().unwrap().compound_selector.is_empty() &&
+               rule.selector.as_ref().unwrap().next.is_none() {
                 if rule.declarations.any_normal() {
-                    matching_rules_list.push(
-                        rule.to_applicable_declaration_block(Importance::Normal));
+                    matching_rules_list.push(ApplicableDeclarationBlock {
+                        rule: rule.clone(),
+                        importance: Importance::Normal,
+                    })
                 }
                 if rule.declarations.any_important() {
-                    matching_rules_list.push(
-                        rule.to_applicable_declaration_block(Importance::Important));
+                    matching_rules_list.push(ApplicableDeclarationBlock {
+                        rule: rule.clone(),
+                        importance: Importance::Important,
+                    })
                 }
             }
         }
 
         sort_by_key(&mut matching_rules_list[init_len..],
-                    |rule| (rule.specificity, rule.source_order));
+                    |block| (block.rule.specificity, block.rule.source_order));
     }
 
     fn get_matching_rules_from_hash<E, Str, BorrowedStr: ?Sized, Vector>(
         element: &E,
         parent_bf: Option<&BloomFilter>,
-        hash: &FnvHashMap<Str, Vec<Rule>>,
+        hash: &FnvHashMap<Str, Vec<Arc<Rule>>>,
         key: &BorrowedStr,
         matching_rules: &mut Vector,
         relations: &mut StyleRelations,
@@ -745,7 +763,7 @@ impl SelectorMap {
     /// Adds rules in `rules` that match `element` to the `matching_rules` list.
     fn get_matching_rules<E, V>(element: &E,
                                 parent_bf: Option<&BloomFilter>,
-                                rules: &[Rule],
+                                rules: &[Arc<Rule>],
                                 matching_rules: &mut V,
                                 relations: &mut StyleRelations,
                                 reason: MatchingReason,
@@ -761,16 +779,19 @@ impl SelectorMap {
                 block.any_normal()
             };
             if any_declaration_for_importance &&
-               matches_complex_selector(&*rule.selector, element, parent_bf,
+               matches_complex_selector(rule.selector.as_ref().unwrap(), element, parent_bf,
                                         relations, reason) {
-                matching_rules.push(rule.to_applicable_declaration_block(importance));
+                matching_rules.push(ApplicableDeclarationBlock {
+                    rule: rule.clone(),
+                    importance: importance,
+                })
             }
         }
     }
 
     /// Insert rule into the correct hash.
     /// Order in which to try: id_hash, class_hash, local_name_hash, other_rules.
-    pub fn insert(&mut self, rule: Rule) {
+    pub fn insert(&mut self, rule: Arc<Rule>) {
         self.empty = false;
 
         if let Some(id_name) = SelectorMap::get_id_name(&rule) {
@@ -794,7 +815,7 @@ impl SelectorMap {
 
     /// Retrieve the first ID name in Rule, or None otherwise.
     pub fn get_id_name(rule: &Rule) -> Option<Atom> {
-        for ss in &rule.selector.compound_selector {
+        for ss in &rule.selector.as_ref().unwrap().compound_selector {
             // TODO(pradeep): Implement case-sensitivity based on the
             // document type and quirks mode.
             if let SimpleSelector::ID(ref id) = *ss {
@@ -807,7 +828,7 @@ impl SelectorMap {
 
     /// Retrieve the FIRST class name in Rule, or None otherwise.
     pub fn get_class_name(rule: &Rule) -> Option<Atom> {
-        for ss in &rule.selector.compound_selector {
+        for ss in &rule.selector.as_ref().unwrap().compound_selector {
             // TODO(pradeep): Implement case-sensitivity based on the
             // document type and quirks mode.
             if let SimpleSelector::Class(ref class) = *ss {
@@ -820,7 +841,7 @@ impl SelectorMap {
 
     /// Retrieve the name if it is a type selector, or None otherwise.
     pub fn get_local_name(rule: &Rule) -> Option<LocalName<TheSelectorImpl>> {
-        for ss in &rule.selector.compound_selector {
+        for ss in &rule.selector.as_ref().unwrap().compound_selector {
             if let SimpleSelector::LocalName(ref n) = *ss {
                 return Some(LocalName {
                     name: n.name.clone(),
@@ -834,27 +855,15 @@ impl SelectorMap {
 }
 
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Rule {
     // This is an Arc because Rule will essentially be cloned for every element
     // that it matches. Selector contains an owned vector (through
     // ComplexSelector) and we want to avoid the allocation.
-    pub selector: Arc<ComplexSelector<TheSelectorImpl>>,
+    pub selector: Option<Arc<ComplexSelector<TheSelectorImpl>>>,
     pub declarations: Arc<PropertyDeclarationBlock>,
     pub source_order: usize,
     pub specificity: u32,
-}
-
-impl Rule {
-    fn to_applicable_declaration_block(&self, importance: Importance)
-                                       -> ApplicableDeclarationBlock {
-        ApplicableDeclarationBlock {
-            mixed_declarations: self.declarations.clone(),
-            importance: importance,
-            source_order: self.source_order,
-            specificity: self.specificity,
-        }
-    }
 }
 
 /// A property declaration together with its precedence among rules of equal specificity so that
@@ -862,30 +871,30 @@ impl Rule {
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 #[derive(Debug, Clone)]
 pub struct ApplicableDeclarationBlock {
-    /// Contains declarations of either importance, but only those of self.importance are relevant.
-    /// Use ApplicableDeclarationBlock::iter
-    pub mixed_declarations: Arc<PropertyDeclarationBlock>,
+    /// Contains declarations of either importance, but only those of
+    /// self.importance are relevant.  Use ApplicableDeclarationBlock::iter
+    pub rule: Arc<Rule>,
     pub importance: Importance,
-    pub source_order: usize,
-    pub specificity: u32,
 }
 
 impl ApplicableDeclarationBlock {
     #[inline]
     pub fn from_declarations(declarations: Arc<PropertyDeclarationBlock>,
-                             importance: Importance)
-                             -> Self {
+                             importance: Importance) -> Self {
         ApplicableDeclarationBlock {
-            mixed_declarations: declarations,
+            rule: Arc::new(Rule {
+                selector: None,
+                declarations: declarations,
+                source_order: 0,
+                specificity: 0,
+            }),
             importance: importance,
-            source_order: 0,
-            specificity: 0,
         }
     }
 
     pub fn iter(&self) -> ApplicableDeclarationBlockIter {
         ApplicableDeclarationBlockIter {
-            iter: self.mixed_declarations.declarations.iter(),
+            iter: self.rule.declarations.declarations.iter(),
             importance: self.importance,
         }
     }
@@ -922,6 +931,8 @@ impl<'a> DoubleEndedIterator for ApplicableDeclarationBlockIter<'a> {
     }
 }
 
-fn find_push<Str: Eq + Hash>(map: &mut FnvHashMap<Str, Vec<Rule>>, key: Str, value: Rule) {
+#[inline]
+fn find_push<Str: Eq + Hash>(map: &mut FnvHashMap<Str, Vec<Arc<Rule>>>, key: Str,
+                             value: Arc<Rule>) {
     map.entry(key).or_insert_with(Vec::new).push(value)
 }
